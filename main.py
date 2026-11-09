@@ -19,20 +19,12 @@ BAR_MS = 300_000
 # Each sequence includes its signal candle as the LAST character.
 # R = red, G = green. The preceding candles must match exactly and consecutively.
 PATTERNS = [
-    ("p01", "RRGRGGGRG", "SHORT", "🔴🔴🟢🔴🟢🟢🟢🔴🟢", "124/124 · 41/41"),
     ("p02", "RRGGGGRGR", "SHORT", "🔴🔴🟢🟢🟢🟢🔴🟢🔴", "117/117 · 36/36"),
     ("p03", "RRGRGGRRR", "LONG",  "🔴🔴🟢🔴🟢🟢🔴🔴🔴", "117/117 · 41/41"),
     ("p04", "GRGRGGRRR", "LONG",  "🟢🔴🟢🔴🟢🟢🔴🔴🔴", "116/116"),
     ("p05", "GGRGGGG",   "SHORT", "🟢🟢🔴🟢🟢🟢🟢", "98,90% · 91"),
     ("p06", "GRGGRRR",   "LONG",  "🟢🔴🟢🟢🔴🔴🔴", "98,69% · 153"),
-    ("p07", "RGRRRGR",   "LONG",  "🔴🟢🔴🔴🔴🟢🔴", "97,12% · 139"),
     ("p08", "RRRGGRG",   "LONG",  "🔴🔴🔴🟢🟢🔴🟢", "Статистика не вказана"),
-    ("p09", "GRGG",      "SHORT", "🟢🔴🟢🟢", "97,99%"),
-    ("p10", "RRRR",      "LONG",  "🔴🔴🔴🔴", "97,98%"),
-    ("p11", "GGRG",      "SHORT", "🟢🟢🔴🟢", "97,97%"),
-    ("p12", "RGGG",      "SHORT", "🔴🟢🟢🟢", "97,87%"),
-    ("p13", "RRR",       "LONG",  "🔴🔴🔴", "97,84%"),
-    ("p14", "GRRR",      "LONG",  "🟢🔴🔴🔴", "Статистика не вказана"),
 ]
 PATTERN_MAP = {p[0]: p for p in PATTERNS}
 
@@ -62,8 +54,17 @@ def init_db():
         db.execute("""CREATE TABLE IF NOT EXISTS signals(
             id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, pattern_id TEXT,
             candle_ms INTEGER, side TEXT, entry REAL, checked INTEGER DEFAULT 0,
-            favorable INTEGER DEFAULT 0, status TEXT DEFAULT 'PENDING',
+            favorable INTEGER DEFAULT 0, favorable_candle INTEGER,
+            status TEXT DEFAULT 'PENDING',
             outcome TEXT, UNIQUE(symbol,pattern_id,candle_ms))""")
+        # Migrate existing Railway SQLite databases without losing saved signals.
+        cols = {row[1] for row in db.execute("PRAGMA table_info(signals)")}
+        if "favorable_candle" not in cols:
+            db.execute("ALTER TABLE signals ADD COLUMN favorable_candle INTEGER")
+        removed_ids = ("p01", "p07", "p09", "p10", "p11", "p12", "p13", "p14")
+        marks = ",".join("?" for _ in removed_ids)
+        db.execute(f"DELETE FROM warnings WHERE pattern_id IN ({marks})", removed_ids)
+        db.execute(f"DELETE FROM signals WHERE pattern_id IN ({marks})", removed_ids)
 
 def stamp(ms):
     return datetime.fromtimestamp(ms/1000, timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC")
@@ -142,30 +143,51 @@ async def confirm_warnings(session, symbol, closed):
 
 async def evaluate(session, symbol, closed):
     with connect() as db:
-        rows = db.execute("""SELECT id,pattern_id,candle_ms,side,entry,checked,favorable
+        rows = db.execute("""SELECT id,pattern_id,candle_ms,side,entry,checked,
+            favorable,favorable_candle
             FROM signals WHERE symbol=? AND status='PENDING'""", (symbol,)).fetchall()
-    for sid,pid,t,side,entry,checked,favorable in rows:
+    for sid,pid,t,side,entry,checked,favorable,favorable_candle in rows:
         following = [c for c in closed if c.t >= t+BAR_MS][:5]
+        if favorable and favorable_candle is None:
+            for index, c in enumerate(following[:checked], start=1):
+                if ((side == "LONG" and c.c > entry) or
+                    (side == "SHORT" and c.c < entry)):
+                    favorable_candle = index
+                    break
+        if len(following) <= checked and favorable_candle is not None:
+            # Persist a recovered candle number even when no new candle arrived.
+            with connect() as db:
+                db.execute("UPDATE signals SET favorable_candle=? WHERE id=?",
+                           (favorable_candle,sid))
+            continue
         if len(following) <= checked:
             continue
-        for c in following[checked:]:
-            if (side == "LONG" and c.c > entry) or (side == "SHORT" and c.c < entry):
+        for index, c in enumerate(following[checked:], start=checked + 1):
+            is_favorable = ((side == "LONG" and c.c > entry) or
+                            (side == "SHORT" and c.c < entry))
+            if is_favorable and not favorable:
                 favorable = 1
+                favorable_candle = index
         n = len(following)
         outcome = ("WIN" if favorable else "LOSS") if n == 5 else None
         with connect() as db:
             if outcome:
-                db.execute("UPDATE signals SET checked=?,favorable=?,status=?,outcome=? WHERE id=?",
-                           (n,favorable,outcome,outcome,sid))
+                db.execute("""UPDATE signals SET checked=?,favorable=?,
+                    favorable_candle=?,status=?,outcome=? WHERE id=?""",
+                    (n,favorable,favorable_candle,outcome,outcome,sid))
             else:
-                db.execute("UPDATE signals SET checked=?,favorable=? WHERE id=?",
-                           (n,favorable,sid))
+                db.execute("""UPDATE signals SET checked=?,favorable=?,
+                    favorable_candle=? WHERE id=?""",
+                    (n,favorable,favorable_candle,sid))
         if outcome:
             pattern = PATTERN_MAP[pid]
-            await tg(session, f"{'🏆' if outcome=='WIN' else '❌'} РЕЗУЛЬТАТ: {outcome} — {symbol}\n"
-                f"Напрямок: {side}\nПатерн: {pattern[3]}\n"
-                f"Перевірено: 5/5 наступних закритих свічок\n"
-                f"Ціна закриття сигнальної свічки: {entry}\n"
+            winning_text = (f"Виграшна свічка: {favorable_candle}/5"
+                            if favorable_candle else "Виграшної свічки: немає")
+            await tg(session, f"{'🏆' if outcome=='WIN' else '❌'} РЕЗУЛЬТАТ: {outcome} — {symbol}\\n"
+                f"Напрямок: {side}\\nПатерн: {pattern[3]}\\n"
+                f"Перевірено: 5/5 наступних закритих свічок\\n"
+                f"{winning_text}\\n"
+                f"Ціна закриття сигнальної свічки: {entry}\\n"
                 f"Сигнал: {stamp(t)}")
 
 async def process(session, symbol):
